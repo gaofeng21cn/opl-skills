@@ -41,9 +41,7 @@ workspace entry point when it exists:
 
 1. Use `$OPL_RELAY_WORKSPACE/AGENTS.md` when `OPL_RELAY_WORKSPACE` is set.
 2. Otherwise use `~/.opl-relay/workspaces/default/AGENTS.md` when present.
-3. Fall back to `$CODEX_MAIL_HOME/AGENTS.md` or
-   `~/.codex-mail-workbench/AGENTS.md` only for an unmigrated installation.
-4. Follow the required read order from that entry point.
+3. Follow the required read order from that entry point.
 
 The overlay supplies policy and personal context only. While this route is
 active, mailbox facts still come exclusively from Apple Mail; do not run
@@ -99,7 +97,9 @@ python3 ~/.codex/skills/apple-mail/scripts/apple_apps.py mail search --account "
 
 - Extract the journal name from the subject, sender, and body.
 - Use model knowledge first. If the journal is clearly reputable and well known, keep it.
-- If the journal quality is uncertain, use `agent-browser` and browse official journal or publisher pages before deciding.
+- If the journal quality is uncertain, use a dedicated search or retrieval tool
+  to inspect official journal or publisher pages; follow the active browser
+  routing policy only when page interaction is needed.
 - If the journal is still unfamiliar, weak, spammy, or hard to verify, treat it as not worth attention and ignore it.
 
 Read [`references/journal-evaluation.md`](references/journal-evaluation.md) when
@@ -136,7 +136,7 @@ For low-value review invitations, one short dismissal line is enough.
 - Prefer `triage-meta` over `recent` for daily screening because it is lighter and faster.
 - Treat `search` as the main tool for context recovery after a candidate email is identified.
 - Do not browse unless the journal quality is uncertain or the user explicitly wants verification.
-- For web checks, prefer `agent-browser` over ad-hoc browsing.
+- For web checks, prefer official sources through the active research route.
 - Reading shared policy never grants permission to send, delete, archive, move,
   or mark mail.
 - Do not claim IMAP freshness, complete-inbox coverage, or a `storage_ref` from

@@ -20,7 +20,8 @@ agent-reach doctor --json
 opencli daemon status
 ```
 
-Use the backend that is live. On this machine, OpenCLI has previously been the working XiaoHongShu backend, but do not assume it without current readback.
+Use the backend established by the current readback; public workflow source
+does not carry one machine's previous backend choice.
 
 2. Search XiaoHongShu with a query that names the domain and repository/tool intent:
 

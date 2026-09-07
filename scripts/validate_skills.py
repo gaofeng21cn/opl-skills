@@ -42,10 +42,6 @@ def validate_skill_dir(skill_dir: Path) -> list[str]:
         errors.append(f"{skill_dir.name}: invalid name '{name}'")
     if not description:
         errors.append(f"{skill_dir.name}: frontmatter missing description")
-    elif not description.startswith(("Use when", "Use only")):
-        errors.append(
-            f"{skill_dir.name}: description should start with 'Use when' or 'Use only'"
-        )
     return errors
 
 

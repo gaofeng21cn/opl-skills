@@ -7,14 +7,11 @@ canonical repository is `gaofeng21cn/opl-skills`.
 
 OPL-owned software-development Skills live in the OPL Flow Plugin and share one
 installation and update lifecycle. This repository keeps only reusable
-non-development workflows that remain useful without OPL Flow:
+non-development workflows that remain useful without OPL Flow.
 
-| Group | Skills |
-| --- | --- |
-| Academic delivery | `academic-defense-prep` |
-| Artifact evidence | `evidence-bound-closeout` |
-| External learning | `external-learning-landing`, `xiaohongshu-repo-scout` |
-| Local app adapters | `apple-mail`, `mail-triage` |
+The [Skill catalog](contracts/skill-catalog.json) owns the current identities,
+source paths, and categories. Individual `SKILL.md` files own their workflow
+instructions and load supporting references only for that subject.
 
 Personal Skills belong in the owner's private OPL Instance. OpenAI and
 third-party Skills are installed and updated through their native owner channel;
@@ -50,3 +47,10 @@ pytest skills/apple-mail/tests/test_mail_meta.py -q
 
 Each Skill must remain independently installable. Public source must not contain
 credentials, machine inventories, private remotes, or absolute personal paths.
+
+Update a workflow's instructions together with its helper or source contract.
+Keep one owner for each procedure; link to another Skill instead of copying its
+implementation or routing policy. Replace superseded advice in place and keep
+completed history in Git. Retiring a workflow removes its catalog entry,
+payload, obsolete checks, and inbound references together after caller cutover;
+do not preserve compatibility instructions in active Skills.
