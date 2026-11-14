@@ -37,12 +37,32 @@ The private OPL Instance may record an explicit desired inventory for multiple
 machines. Each node still installs from this owner; Fleet reports presence and
 does not copy Skill bytes between machines.
 
+### Mac disk diagnosis and cleanup
+
+[`mac-disk-steward`](skills/mac-disk-steward/SKILL.md) investigates new disk
+usage, evaluates developer and test residue, and chooses between removal,
+NAS storage, cloud-file eviction, and local retention. Its helpers capture
+read-only space baselines and verify copied file trees or tar archives; they
+do not delete source data. Baseline capture requires macOS; the Python helpers
+use only the standard library (Python 3.9 or newer).
+
+```bash
+python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
+  --repo gaofeng21cn/opl-skills \
+  --path skills/mac-disk-steward
+```
+
+Invoke `$mac-disk-steward` to investigate disk growth or clean up an explicitly
+authorized scope. Optional NAS paths and local retention choices belong in the
+user's `~/.config/mac-disk-steward/profile.json`; no personal profile is included.
+
 ## Development
 
 ```bash
 python scripts/validate_skills.py
 python -m unittest tests/test_validate_skill_catalog.py
 pytest skills/apple-mail/tests/test_mail_meta.py -q
+python -m unittest discover -s skills/mac-disk-steward/tests
 ```
 
 Each Skill must remain independently installable. Public source must not contain

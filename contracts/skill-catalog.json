@@ -20,6 +20,10 @@
       "source_path": "skills/external-learning-landing",
       "categories": ["external-learning"]
     },
+    "mac-disk-steward": {
+      "source_path": "skills/mac-disk-steward",
+      "categories": ["local-application-adapter"]
+    },
     "mail-triage": {
       "source_path": "skills/mail-triage",
       "categories": ["local-application-adapter"]
