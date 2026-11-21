@@ -52,8 +52,9 @@ For “叙事逻辑” or reviewer-facing rewrite:
 When asked to update PPT speaker notes:
 - Treat notes plus timed script as paired deliverables if both are requested.
 - Keep each note aligned to the slide’s role in the oral flow, not a verbatim copy of slide bullets.
-- After bulk note replacement, verify both the user-visible notes query and package integrity.
-- If an old note survives despite successful high-level commands, inspect `ppt/notesSlides/notesSlideN.xml`; duplicate placeholder shapes can preserve stale text. Fix on a temporary copy first if the resident process hangs or reports a busy pipe.
+- Use `officecli add <deck> '/slide[N]' --type notes --prop text=...` when the slide has no notes part. Use `set` on `'/slide[N]/notes'` to replace existing notes. Read each changed slide's notes back against its script.
+- With a resident open, run `officecli save <deck>` before reading the ZIP from another tool. After reordering slides, follow the presentation's slide relationships and each slide's notes relationship. The suffix on `notesSlideN.xml` can differ from the displayed slide number.
+- If text still differs, inspect the notes shape with placeholder type `body`. Other shapes can contain a slide number, date, or footer. Preserve them during a repair and work on a copy if direct XML editing is needed. [OfficeCLI notes fix](https://github.com/iOfficeAI/OfficeCLI/commit/1cc86397b7f7eb253b90a249decc4b3adafe4bd8) · [OfficeCLI v1.0.163](https://github.com/iOfficeAI/OfficeCLI/releases/tag/v1.0.163)
 
 ## Defense Questions
 

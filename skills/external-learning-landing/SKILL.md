@@ -9,7 +9,7 @@ Treat the external system as a pattern source, not local authority.
 
 ## Workflow
 
-1. Read the current external primary source and the target repo's owner surfaces.
+1. Identify how the upstream distributes the relevant component. Compare the local adaptation with that release tag or pinned source revision. For a repository that distributes from its default branch, record the commit. Trace community reports to a merged change, reproduction, or release containing the fix. Distinguish a fix that has landed on the branch from one available to installed users.
 2. Extract reusable behavior, data shape, failure handling, evaluation, or workflow patterns without importing foreign branding or runtime assumptions.
 3. Classify each candidate as `adopt`, `adapt`, `watch_only`, `reject`, or `no_code_needed`.
 4. For `adopt` or `adapt`, map the candidate to one existing local owner surface, intended behavior change, and claim-appropriate acceptance evidence.

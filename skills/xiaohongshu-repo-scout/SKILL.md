@@ -13,29 +13,21 @@ This skill complements `agent-reach`: use `agent-reach` or OpenCLI to fetch Xiao
 
 ## Evidence Order
 
-1. Check the active XiaoHongShu backend before reading:
+1. Use the user's selected read route. For Agent Reach, `agent-reach channels` lists the XiaoHongShu actions supported by the installed CLI. Search for a domain and repository together:
 
 ```bash
-agent-reach doctor --json
-opencli daemon status
+agent-reach xiaohongshu search "<query>" --limit 5
 ```
 
-Use the backend established by the current readback; public workflow source
-does not carry one machine's previous backend choice.
-
-2. Search XiaoHongShu with a query that names the domain and repository/tool intent:
+2. Read a promising note with its complete URL from the search response, including the access query when present:
 
 ```bash
-opencli xiaohongshu search "<query>" -f yaml
+agent-reach xiaohongshu read "<full-search-result-url>"
 ```
 
-3. Read promising notes by passing the full search-result URL that includes `xsec_token`, not a bare note id:
+   Check the returned note text for an identifiable repository. A public-web snippet can yield a lead. Record it as a snippet until the note body is available. If the route reports a login requirement, rate limit or platform block, keep the evidence already obtained and report the gap.
 
-```bash
-opencli xiaohongshu note "<full-search-result-url-with-xsec-token>" -f yaml
-```
-
-If search works but note reads fail, first check whether the URL lost `xsec_token`.
+3. For a selected OpenCLI route, use `opencli xiaohongshu search "<query>" -f json` followed by `opencli xiaohongshu note "<full-search-result-url>" -f json`. OpenCLI 2 wraps rows in `{ok, data}`. Inspect the field/value rows under `data`; a successful response with an empty list supplies no note. Keep access parameters in the read request only. Cite the title or a public note permalink in reports. [Agent Reach v1.6.1](https://github.com/Panniantong/Agent-Reach/releases/tag/v1.6.1) · [OpenCLI response handling](https://github.com/Panniantong/Agent-Reach/commit/387b2b7)
 
 4. Extract only explicit repository identities:
    - Direct GitHub URLs.
@@ -46,11 +38,11 @@ If search works but note reads fail, first check whether the URL lost `xsec_toke
 5. Verify each candidate with GitHub:
 
 ```bash
-gh repo view <owner>/<repo> --json nameWithOwner,description,stargazerCount,forkCount,updatedAt,url,isArchived,defaultBranchRef
+gh repo view <owner>/<repo> --json nameWithOwner,description,stargazerCount,forkCount,pushedAt,latestRelease,url,isArchived,defaultBranchRef
 gh search repos "<project name>" --sort stars --limit 10
 ```
 
-Use current GitHub evidence for stars, archive state, description, and update recency. If GitHub API rate limiting blocks verification, report that as a verification gap and do not claim current stars or freshness.
+Use the latest release tag and publication date for what users can install. For default-branch activity, read its latest commit and date when that matters. Repository-wide `pushedAt` can reflect another branch. A repository with no GitHub Release may publish through a package registry or tags. If GitHub API rate limiting blocks verification, report that as a verification gap and do not claim current stars or freshness.
 
 ## Candidate Rules
 
@@ -78,7 +70,7 @@ For each recommended repo include:
 - Repository name and URL.
 - Why it is relevant to the user's requested workflow.
 - Fresh stars and update signal from GitHub.
-- Source lead: XiaoHongShu query/note title or URL when available.
+- Source lead: XiaoHongShu query, note title, or public permalink with access parameters removed.
 - Confidence: high / medium / low.
 - Caveat or next check if the repo should be tried before adoption.
 
