@@ -6,8 +6,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:  # Bare CI / stdlib-only python3 fallback
+    yaml = None
+
 
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _parse_frontmatter_stdlib(block: str) -> dict[str, str]:
+    data: dict[str, str] = {}
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        data[key.strip()] = value
+    return data
 
 
 def parse_frontmatter(text: str) -> dict[str, str]:
@@ -17,15 +36,14 @@ def parse_frontmatter(text: str) -> dict[str, str]:
     if end == -1:
         raise ValueError("missing YAML frontmatter closing delimiter")
     block = text[4:end]
-    data: dict[str, str] = {}
-    for raw_line in block.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        value = value.strip().strip('"').strip("'")
-        data[key.strip()] = value
-    return data
+    if yaml is not None:
+        loaded = yaml.safe_load(block)
+        if loaded is None:
+            return {}
+        if not isinstance(loaded, dict):
+            raise ValueError("YAML frontmatter must be a mapping")
+        return {str(key): "" if value is None else str(value) for key, value in loaded.items()}
+    return _parse_frontmatter_stdlib(block)
 
 
 def validate_skill_dir(skill_dir: Path) -> list[str]:
