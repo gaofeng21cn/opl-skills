@@ -5,7 +5,6 @@ import importlib.util
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "validate_skill_catalog",
@@ -39,6 +38,27 @@ class SkillCatalogValidationTests(unittest.TestCase):
         catalog = copy.deepcopy(self.catalog)
         del catalog["skills"]["academic-defense-prep"]
         self.assertTrue(any("catalog differs from source" in error for error in MODULE.validate(catalog)))
+
+    def test_validate_skills_frontmatter_handles_pyyaml_and_stdlib_fallback(self) -> None:
+        spec = importlib.util.spec_from_file_location("validate_skills", ROOT / "scripts/validate_skills.py")
+        assert spec and spec.loader
+        validate_skills = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validate_skills)
+
+        sample = '---\nname: sample-skill\ndescription: "Use when: testing quotes"\n---\n# Body\n'
+        self.assertEqual(
+            validate_skills.parse_frontmatter(sample),
+            {"name": "sample-skill", "description": "Use when: testing quotes"},
+        )
+        original_yaml = validate_skills.yaml
+        try:
+            validate_skills.yaml = None
+            self.assertEqual(
+                validate_skills.parse_frontmatter(sample),
+                {"name": "sample-skill", "description": "Use when: testing quotes"},
+            )
+        finally:
+            validate_skills.yaml = original_yaml
 
 
 if __name__ == "__main__":

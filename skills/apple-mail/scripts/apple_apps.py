@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import email.policy
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from email.parser import HeaderParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAIL_SCRIPT = SCRIPT_DIR / "apple_apps_mail.js"
@@ -29,17 +32,37 @@ KEY_MAP = {
 }
 FAST_INBOX_NAMES = {"INBOX", "Inbox", "收件箱", "收件匣"}
 FAST_ACCOUNT_NAMES_SCRIPT = 'tell application "Mail" to get name of every account'
+
+# macOS Mail.app can emit localized Chinese header field names in allHeaders().
+# RFC 5322 HeaderParser only accepts ASCII field names, so map known localized
+# prefixes to ASCII proxy headers before parsing and restore original names.
+LOCALIZED_TO_PROXY = {
+    "发件人": "X-Apple-Mail-Localized-From",
+    "收件人": "X-Apple-Mail-Localized-To",
+    "主题": "X-Apple-Mail-Localized-Subject",
+    "日期": "X-Apple-Mail-Localized-Date",
+}
+PROXY_TO_LOCALIZED = {proxy.lower(): local for local, proxy in LOCALIZED_TO_PROXY.items()}
+LOCALIZED_HEADER_PREFIX = re.compile(
+    r"^(?P<name>" + "|".join(re.escape(key) for key in LOCALIZED_TO_PROXY) + r")(?=\s*:)",
+    re.MULTILINE,
+)
 HEADER_NAME_MAP = {
-    "subject": {"subject", "主题"},
-    "sender": {"from", "发件人"},
-    "date": {"date", "日期"},
-    "to": {"to", "收件人"},
-    "message_id": {"message-id"},
-    "in_reply_to": {"in-reply-to"},
-    "references": {"references"},
+    "subject": ("Subject", "X-Apple-Mail-Localized-Subject"),
+    "sender": ("From", "X-Apple-Mail-Localized-From"),
+    "date": ("Date", "X-Apple-Mail-Localized-Date"),
+    "to": ("To", "X-Apple-Mail-Localized-To"),
+    "message_id": ("Message-Id",),
+    "in_reply_to": ("In-Reply-To",),
+    "references": ("References",),
 }
 MESSAGE_ID_PATTERN = re.compile(r"<[^>]+>")
 THREAD_PREFIX_PATTERN = re.compile(r"^\s*(?:(?:re|fw|fwd)(?:\[\d+\])?:\s*)+", re.IGNORECASE)
+ZH_DATE_PATTERN = re.compile(
+    r"^(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日\s+"
+    r"GMT(?P<offset>[+-]\d{1,2})(?::?(?P<offset_minutes>\d{2}))?\s+"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?$"
+)
 
 
 def str_to_bool(value: str) -> bool:
@@ -51,33 +74,32 @@ def str_to_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
 
+def _parse_header_message(headers: str):
+    normalized = LOCALIZED_HEADER_PREFIX.sub(
+        lambda match: LOCALIZED_TO_PROXY[match.group("name")],
+        headers or "",
+    )
+    return HeaderParser(policy=email.policy.default).parsestr(normalized)
+
+
 def unfold_headers(headers: str) -> list[tuple[str, str]]:
-    unfolded: list[tuple[str, str]] = []
-    current_name: str | None = None
-    current_value: list[str] = []
-    for raw_line in headers.splitlines():
-        if raw_line[:1] in {" ", "\t"} and current_name is not None:
-            current_value.append(raw_line.strip())
-            continue
-        if current_name is not None:
-            unfolded.append((current_name, " ".join(current_value).strip()))
-        if ":" not in raw_line:
-            current_name = None
-            current_value = []
-            continue
-        name, value = raw_line.split(":", 1)
-        current_name = name.strip()
-        current_value = [value.strip()]
-    if current_name is not None:
-        unfolded.append((current_name, " ".join(current_value).strip()))
-    return unfolded
+    """Parse, unfold, and RFC 2047-decode raw headers using stdlib HeaderParser."""
+    message = _parse_header_message(headers)
+    items: list[tuple[str, str]] = []
+    for name, value in message.items():
+        display_name = PROXY_TO_LOCALIZED.get(name.lower(), name)
+        cleaned = " ".join(str(value).splitlines()).strip()
+        items.append((display_name, cleaned))
+    return items
 
 
 def extract_header_value(headers: str, logical_name: str) -> tuple[str | None, str | None]:
-    wanted = HEADER_NAME_MAP[logical_name]
-    for name, value in unfold_headers(headers):
-        if name.strip().lower() in wanted:
-            return name, value
+    message = _parse_header_message(headers)
+    wanted = {candidate.lower() for candidate in HEADER_NAME_MAP[logical_name]}
+    for name, value in message.items():
+        if name.lower() in wanted:
+            display_name = PROXY_TO_LOCALIZED.get(name.lower(), name)
+            return display_name, " ".join(str(value).splitlines()).strip()
     return None, None
 
 
@@ -85,10 +107,7 @@ def parse_header_datetime(value: str | None) -> str | None:
     if not value:
         return None
     cleaned = value.strip()
-    zh_match = re.match(
-        r"^(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日\s+GMT(?P<offset>[+-]\d{1,2})(?::?(?P<offset_minutes>\d{2}))?\s+(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?$",
-        cleaned,
-    )
+    zh_match = ZH_DATE_PATTERN.match(cleaned)
     if zh_match:
         offset_hours = int(zh_match.group("offset"))
         offset_minutes = int(zh_match.group("offset_minutes") or 0)
@@ -109,15 +128,13 @@ def parse_header_datetime(value: str | None) -> str | None:
         parsed = parsedate_to_datetime(cleaned)
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return parsed.isoformat()
     return parsed.isoformat()
 
 
 def extract_received_date(headers: str) -> tuple[str | None, str | None]:
-    for name, value in unfold_headers(headers):
-        if name.strip().lower() != "received":
-            continue
+    message = _parse_header_message(headers)
+    for raw_value in message.get_all("Received") or ():
+        value = " ".join(str(raw_value).splitlines()).strip()
         _, separator, date_value = value.rpartition(";")
         candidate = date_value.strip() if separator else value.strip()
         parsed = parse_header_datetime(candidate)
@@ -127,8 +144,8 @@ def extract_received_date(headers: str) -> tuple[str | None, str | None]:
 
 
 def extract_header_metadata(headers: str) -> dict[str, str | None]:
-    subject_name, subject_value = extract_header_value(headers, "subject")
-    sender_name, sender_value = extract_header_value(headers, "sender")
+    _, subject_value = extract_header_value(headers, "subject")
+    _, sender_value = extract_header_value(headers, "sender")
     date_name, date_value = extract_header_value(headers, "date")
     date_iso = parse_header_datetime(date_value)
     date_source = date_name
@@ -297,7 +314,10 @@ def search_meta_items(items: list[dict], *, query: str, limit: int) -> list[dict
             if value:
                 thread_ids.add(str(value))
 
-    direct_matches.sort(key=lambda item: (item.get("matchScore") or 0, item.get("headerDateIso") or ""), reverse=True)
+    direct_matches.sort(
+        key=lambda item: (item.get("matchScore") or 0, item.get("headerDateIso") or ""),
+        reverse=True,
+    )
     if not direct_matches:
         return []
 
@@ -325,6 +345,157 @@ def search_meta_items(items: list[dict], *, query: str, limit: int) -> list[dict
 
     context_matches.sort(key=lambda item: item.get("headerDateIso") or "", reverse=True)
     return (direct_matches + context_matches)[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Canonical backend delegation (opl-relay / himalaya) + Mail.app JXA fallback
+# ---------------------------------------------------------------------------
+
+
+def resolve_opl_relay_bin() -> str | None:
+    configured = os.environ.get("OPL_RELAY_BIN", "").strip()
+    if configured:
+        return configured
+    return shutil.which("opl-relay")
+
+
+def resolve_himalaya_bin() -> str | None:
+    configured = os.environ.get("HIMALAYA_BIN", "").strip()
+    if configured:
+        return configured
+    return shutil.which("himalaya")
+
+
+def _run_json_command(cmd: list[str]) -> object | None:
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def delegate_to_opl_relay(action: str, payload: dict, *, allow_store_search: bool = False) -> object | None:
+    """Delegate canonical read/search operations to opl-relay when available."""
+    relay_bin = resolve_opl_relay_bin()
+    if not relay_bin:
+        return None
+    if action == "accounts":
+        data = _run_json_command([relay_bin, "--json", "apple-mail", "accounts"])
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("accounts"), list):
+            return data["accounts"]
+        return None
+    if action == "mailboxes" and payload.get("account"):
+        data = _run_json_command(
+            [relay_bin, "--json", "apple-mail", "mailboxes", "--account", str(payload["account"])]
+        )
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("mailboxes"), list):
+            return data["mailboxes"]
+        return None
+    if action == "recent" and payload.get("account"):
+        mailbox_path = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
+        cmd = [
+            relay_bin,
+            "--json",
+            "apple-mail",
+            "recent",
+            "--account",
+            str(payload["account"]),
+            "--mailbox-path",
+            mailbox_path,
+            "--limit",
+            str(int(payload.get("limit", 20))),
+        ]
+        if payload.get("includeRead"):
+            cmd.append("--include-read")
+        data = _run_json_command(cmd)
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("messages"), list):
+            return data["messages"]
+        return None
+    if action == "read" and payload.get("account") and payload.get("id"):
+        mailbox_path = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
+        data = _run_json_command(
+            [
+                relay_bin,
+                "--json",
+                "apple-mail",
+                "read",
+                "--account",
+                str(payload["account"]),
+                "--mailbox-path",
+                mailbox_path,
+                "--id",
+                str(payload["id"]),
+            ]
+        )
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("message"), dict):
+            return data["message"]
+        return None
+    if action == "search" and allow_store_search:
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return None
+        cmd = [relay_bin, "--json", "search", query, "--limit", str(int(payload.get("limit", 20)))]
+        if payload.get("account"):
+            cmd.extend(["--account", str(payload["account"])])
+        if payload.get("mailboxPath") or payload.get("mailbox"):
+            cmd.extend(["--folder", str(payload.get("mailboxPath") or payload.get("mailbox"))])
+        if not payload.get("includeBody"):
+            cmd.append("--no-include-body")
+        data = _run_json_command(cmd)
+        if isinstance(data, dict) and data.get("ok") and isinstance(data.get("messages"), list):
+            return data["messages"]
+        return None
+    return None
+
+
+def delegate_to_himalaya(action: str, payload: dict) -> object | None:
+    """Delegate IMAP/envelope operations to himalaya when explicitly selected."""
+    himalaya_bin = resolve_himalaya_bin()
+    if not himalaya_bin:
+        return None
+    account_args = ["--account", str(payload["account"])] if payload.get("account") else []
+    folder = str(payload.get("mailboxPath") or payload.get("mailbox") or "")
+    folder_args = ["--folder", folder] if folder else []
+    if action == "accounts":
+        return _run_json_command([himalaya_bin, "--output", "json", "account", "list"])
+    if action == "mailboxes":
+        return _run_json_command([himalaya_bin, "--output", "json", "folder", "list", *account_args])
+    if action == "recent":
+        cmd = [
+            himalaya_bin,
+            "--output",
+            "json",
+            "envelope",
+            "list",
+            *account_args,
+            *folder_args,
+            "--page-size",
+            str(int(payload.get("limit", 20))),
+        ]
+        return _run_json_command(cmd)
+    if action == "search":
+        query = str(payload.get("query") or "").strip()
+        cmd = [
+            himalaya_bin,
+            "--output",
+            "json",
+            "envelope",
+            "list",
+            *account_args,
+            *folder_args,
+            "--page-size",
+            str(int(payload.get("limit", 20))),
+        ]
+        if query:
+            cmd.append(query)
+        return _run_json_command(cmd)
+    if action == "read" and payload.get("id"):
+        return _run_json_command(
+            [himalaya_bin, "--output", "json", "message", "read", *account_args, *folder_args, str(payload["id"])]
+        )
+    return None
 
 
 def run_mail(action: str, payload: dict) -> object:
@@ -389,18 +560,6 @@ def parse_recent_rows_output(output: str) -> list[dict]:
     return rows
 
 
-def run_jxa_inline(script: str, args: list[str]) -> object:
-    cmd = ["osascript", "-l", "JavaScript", "-e", script, *args]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        message = (result.stderr or result.stdout).strip()
-        raise SystemExit(message or "inline JXA command failed")
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid JSON from inline JXA helper: {exc}") from exc
-
-
 def list_account_names_fast() -> list[str]:
     output = run_applescript(FAST_ACCOUNT_NAMES_SCRIPT, [])
     if not output:
@@ -410,362 +569,247 @@ def list_account_names_fast() -> list[str]:
 
 def can_use_fast_recent(payload: dict) -> bool:
     mailbox = payload.get("mailboxPath") or payload.get("mailbox")
-    if not mailbox:
-        return True
-    return mailbox in FAST_INBOX_NAMES
+    return not mailbox or mailbox in FAST_INBOX_NAMES
+
+
+def recent_rows_for_account(account: str, mailbox: str, limit: int, *, start_index: int = 1) -> list[dict]:
+    args = [account, mailbox, str(limit)]
+    if start_index > 1:
+        args.append(str(start_index))
+    return parse_recent_rows_output(run_applescript_file(RECENT_SCRIPT, args))
+
+
+def inline_triage_meta_for_account(account: str, mailbox: str, limit: int) -> list[dict]:
+    result = run_mail("triageMeta", {"account": account, "mailboxPath": mailbox, "limit": limit})
+    return result if isinstance(result, list) else []
+
+
+def inline_headers_for_messages(account: str, mailbox: str, message_ids: list[int]) -> list[dict]:
+    result = run_mail("batchHeaders", {"account": account, "mailboxPath": mailbox, "ids": message_ids})
+    return result if isinstance(result, list) else []
+
+
+def inline_bodies_for_messages(account: str, mailbox: str, message_ids: list[int]) -> list[dict]:
+    result = run_mail("batchBodies", {"account": account, "mailboxPath": mailbox, "ids": message_ids})
+    return result if isinstance(result, list) else []
 
 
 def fast_recent(payload: dict) -> list[dict]:
     requested_limit = int(payload.get("limit", 20))
     mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
-    if payload.get("account") and requested_limit == 1 and mailbox_name in FAST_INBOX_NAMES:
-        rows = inline_recent_for_account(str(payload["account"]), mailbox_name, 1)
-        if payload.get("includeRead"):
-            return rows[:1]
-        filtered = [row for row in rows if not row.get("read")]
-        return filtered[:1]
-
-    if payload.get("account"):
-        accounts = [str(payload["account"])]
-    else:
-        accounts = list_account_names_fast()
-
+    accounts = [str(payload["account"])] if payload.get("account") else list_account_names_fast()
     per_account_limit = int(payload.get("maxScanPerBox") or max(requested_limit + 2, 5))
     include_read = bool(payload.get("includeRead"))
     rows: list[dict] = []
-
     for account_name in accounts:
         try:
-            output = run_applescript_file(RECENT_SCRIPT, [account_name, mailbox_name, str(per_account_limit)])
+            items = recent_rows_for_account(account_name, mailbox_name, per_account_limit)
         except SystemExit:
             continue
-        for item in parse_recent_rows_output(output):
+        for item in items:
             if not include_read and item["read"]:
                 continue
             rows.append(item)
-
     rows.sort(key=lambda item: item.get("dateReceived") or item.get("dateSent") or "", reverse=True)
     return rows[:requested_limit]
 
 
-def can_use_inline_mailbox(payload: dict) -> bool:
-    mailbox = str(payload.get("mailboxPath") or payload.get("mailbox") or "")
-    return bool(payload.get("account")) and bool(mailbox) and "/" not in mailbox
-
-
-def inline_recent_for_account(account: str, mailbox: str, limit: int) -> list[dict]:
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var limit = Number(argv[2]);
-  var out = [];
-  for (var i = 0; i < limit; i++) {
-    var message = box.messages[i];
-    if (!message) {
-      break;
-    }
-    try {
-      out.push({
-        id: message.id(),
-        messageId: message.messageId(),
-        subject: message.subject(),
-        sender: message.sender(),
-        read: message.readStatus(),
-        mailbox: box.name(),
-        mailboxPath: box.name(),
-        account: account.name()
-      });
-    } catch (error) {
-      break;
-    }
-  }
-  return JSON.stringify(out);
-}
-'''
-    return run_jxa_inline(script, [account, mailbox, str(limit)])
-
-
-def recent_rows_for_account(account: str, mailbox: str, limit: int) -> list[dict]:
-    output = run_applescript_file(RECENT_SCRIPT, [account, mailbox, str(limit)])
-    return parse_recent_rows_output(output)
-
-
-def search_recent_rows_for_account(account: str, mailbox: str, limit: int, *, start_index: int = 1) -> list[dict]:
-    script = r'''
-on sanitizeText(valueText)
-    set sourceText to valueText as text
-    set oldTids to AppleScript's text item delimiters
-    set AppleScript's text item delimiters to {return, linefeed, tab}
-    set parts to text items of sourceText
-    set AppleScript's text item delimiters to " "
-    set cleanedText to parts as text
-    set AppleScript's text item delimiters to oldTids
-    return cleanedText
-end sanitizeText
-
-on run argv
-    set accountName to item 1 of argv
-    set mailboxName to item 2 of argv
-    set requestedLimit to (item 3 of argv) as integer
-    set startIndex to (item 4 of argv) as integer
-
-    tell application "Mail"
-        tell mailbox mailboxName of account accountName
-            set totalCount to count of messages
-            if totalCount is 0 then
-                return ""
-            end if
-            if startIndex < 1 then
-                set startIndex to 1
-            end if
-            if startIndex > totalCount then
-                return ""
-            end if
-            set endIndex to (startIndex + requestedLimit - 1)
-            if endIndex > totalCount then
-                set endIndex to totalCount
-            end if
-            set messageIds to (get id of messages startIndex thru endIndex)
-            set internetMessageIds to (get message id of messages startIndex thru endIndex)
-            set subjects to (get subject of messages startIndex thru endIndex)
-            set senders to (get sender of messages startIndex thru endIndex)
-            set readStatuses to (get read status of messages startIndex thru endIndex)
-            set rows to {}
-            set rowCount to (endIndex - startIndex + 1)
-            repeat with i from 1 to rowCount
-                set end of rows to ((item i of messageIds as text) & tab & my sanitizeText(item i of internetMessageIds) & tab & my sanitizeText(item i of subjects) & tab & my sanitizeText(item i of senders) & tab & (item i of readStatuses as text) & tab & mailboxName & tab & accountName & tab & tab)
-            end repeat
-        end tell
-    end tell
-
-    set oldTids to AppleScript's text item delimiters
-    set AppleScript's text item delimiters to linefeed
-    set outputText to rows as text
-    set AppleScript's text item delimiters to oldTids
-    return outputText
-end run
-'''
-    output = run_applescript(script, [account, mailbox, str(limit), str(start_index)])
-    return parse_recent_rows_output(output)
-
-
-def inline_read(payload: dict) -> dict:
-    mailbox = str(payload.get("mailboxPath") or payload.get("mailbox"))
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var message = box.messages.byId(Number(argv[2]));
-  return JSON.stringify({
-    id: message.id(),
-    messageId: message.messageId(),
-    subject: message.subject(),
-    sender: message.sender(),
-    read: message.readStatus(),
-    flagged: message.flaggedStatus(),
-    mailbox: box.name(),
-    mailboxPath: box.name(),
-    account: account.name(),
-    content: message.content(),
-    allHeaders: message.allHeaders()
-  });
-}
-'''
-    return run_jxa_inline(script, [str(payload["account"]), mailbox, str(payload["id"])])
-
-
-def inline_triage_meta_for_account(account: str, mailbox: str, limit: int) -> list[dict]:
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var limit = Number(argv[2]);
-  var out = [];
-  for (var i = 0; i < limit; i++) {
-    var message = box.messages[i];
-    if (!message) {
-      break;
-    }
-    try {
-      out.push({
-        id: message.id(),
-        messageId: message.messageId(),
-        subject: message.subject(),
-        sender: message.sender(),
-        read: message.readStatus(),
-        mailbox: box.name(),
-        mailboxPath: box.name(),
-        account: account.name(),
-        allHeaders: message.allHeaders()
-      });
-    } catch (error) {
-      break;
-    }
-  }
-  return JSON.stringify(out);
-}
-'''
-    return run_jxa_inline(script, [account, mailbox, str(limit)])
-
-
-def inline_headers_for_messages(account: str, mailbox: str, message_ids: list[int]) -> list[dict]:
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var ids = JSON.parse(argv[2]);
-  var out = [];
-  for (var i = 0; i < ids.length; i++) {
-    try {
-      var message = box.messages.byId(Number(ids[i]));
-      out.push({
-        id: message.id(),
-        allHeaders: message.allHeaders()
-      });
-    } catch (error) {
-      continue;
-    }
-  }
-  return JSON.stringify(out);
-}
-'''
-    return run_jxa_inline(script, [account, mailbox, json.dumps(message_ids)])
-
-
-def inline_bodies_for_messages(account: str, mailbox: str, message_ids: list[int]) -> list[dict]:
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var ids = JSON.parse(argv[2]);
-  var out = [];
-  for (var i = 0; i < ids.length; i++) {
-    try {
-      var message = box.messages.byId(Number(ids[i]));
-      out.push({
-        id: message.id(),
-        content: message.content(),
-        allHeaders: message.allHeaders()
-      });
-    } catch (error) {
-      continue;
-    }
-  }
-  return JSON.stringify(out);
-}
-'''
-    return run_jxa_inline(script, [account, mailbox, json.dumps(message_ids)])
-
-
-def inline_mark(payload: dict) -> dict:
-    mailbox = str(payload.get("mailboxPath") or payload.get("mailbox"))
-    read_value = "" if payload.get("read") is None else ("true" if payload.get("read") else "false")
-    flagged_value = "" if payload.get("flagged") is None else ("true" if payload.get("flagged") else "false")
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var message = box.messages.byId(Number(argv[2]));
-  if (argv[3] !== "") {
-    message.readStatus = argv[3] === "true";
-  }
-  if (argv[4] !== "") {
-    message.flaggedStatus = argv[4] === "true";
-  }
-  return JSON.stringify({
-    ok: true,
-    id: message.id(),
-    account: account.name(),
-    mailbox: box.name(),
-    mailboxPath: box.name(),
-    read: message.readStatus(),
-    flagged: message.flaggedStatus()
-  });
-}
-'''
-    return run_jxa_inline(script, [str(payload["account"]), mailbox, str(payload["id"]), read_value, flagged_value])
-
-
-def inline_move(payload: dict) -> dict:
-    source_mailbox = str(payload.get("mailboxPath") or payload.get("mailbox"))
-    destination_account = str(payload.get("toAccount") or payload["account"])
-    destination_mailbox = str(payload.get("toMailboxPath") or payload.get("toMailbox"))
-    if "/" in destination_mailbox:
-        raise SystemExit("inline move only supports top-level destination mailboxes")
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var sourceAccount = app.accounts.byName(argv[0]);
-  var sourceBox = sourceAccount.mailboxes.byName(argv[1]);
-  var message = sourceBox.messages.byId(Number(argv[2]));
-  var destAccount = app.accounts.byName(argv[3]);
-  var destBox = destAccount.mailboxes.byName(argv[4]);
-  app.move(message, {to: destBox});
-  return JSON.stringify({
-    ok: true,
-    id: Number(argv[2]),
-    account: sourceAccount.name(),
-    mailbox: sourceBox.name(),
-    mailboxPath: sourceBox.name(),
-    toAccount: destAccount.name(),
-    toMailbox: destBox.name(),
-    toMailboxPath: destBox.name()
-  });
-}
-'''
-    return run_jxa_inline(
-        script,
-        [str(payload["account"]), source_mailbox, str(payload["id"]), destination_account, destination_mailbox],
-    )
-
-
-def inline_archive(payload: dict) -> dict:
-    destination_mailboxes = ["Archive", "Archives", "All Mail", "归档", "存档", "已归档"]
-    explicit = payload.get("archiveMailboxPath") or payload.get("archiveMailbox")
-    if explicit:
-        destination_mailboxes = [str(explicit)]
-    last_error = None
-    for mailbox_name in destination_mailboxes:
+def collect_meta_items(payload: dict, *, limit: int, include_thread: bool) -> list[dict]:
+    mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
+    accounts = [str(payload["account"])] if payload.get("account") else list_account_names_fast()
+    items: list[dict] = []
+    for account_name in accounts:
         try:
-            next_payload = dict(payload)
-            next_payload["toAccount"] = payload["account"]
-            next_payload["toMailbox"] = mailbox_name
-            next_payload["toMailboxPath"] = mailbox_name
-            return inline_move(next_payload)
-        except SystemExit as exc:
-            last_error = exc
+            rows = inline_triage_meta_for_account(account_name, mailbox_name, limit)
+        except SystemExit:
             continue
-    if last_error:
-        raise last_error
-    raise SystemExit("archive mailbox not found")
+        for row in rows:
+            headers = str(row.pop("allHeaders", "") or "")
+            items.append(build_search_meta_item(row, headers) if include_thread else build_triage_meta_item(row, headers))
+    return items
 
 
-def inline_delete(payload: dict) -> dict:
-    mailbox = str(payload.get("mailboxPath") or payload.get("mailbox"))
-    script = r'''
-function run(argv) {
-  var app = Application("Mail");
-  var account = app.accounts.byName(argv[0]);
-  var box = account.mailboxes.byName(argv[1]);
-  var message = box.messages.byId(Number(argv[2]));
-  app.delete(message);
-  return JSON.stringify({
-    ok: true,
-    id: Number(argv[2]),
-    account: account.name(),
-    mailbox: box.name(),
-    mailboxPath: box.name()
-  });
-}
-'''
-    return run_jxa_inline(script, [str(payload["account"]), mailbox, str(payload["id"])])
+def score_basic_row(row: dict, query: str) -> int:
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        return 0
+    haystacks = [
+        str(row.get("subject") or "").lower(),
+        normalize_thread_subject(str(row.get("subject") or "")),
+        str(row.get("sender") or "").lower(),
+        str(row.get("messageId") or "").lower(),
+    ]
+    score = 0
+    if normalized_query in haystacks[3]:
+        score += 120
+    if normalized_query in haystacks[0]:
+        score += 90
+    if normalized_query in haystacks[1]:
+        score += 70
+    if normalized_query in haystacks[2]:
+        score += 80
+    return score
+
+
+def select_context_rows(rows: list[dict], direct_rows: list[dict], limit: int) -> list[dict]:
+    direct_ids = {row.get("id") for row in direct_rows}
+    direct_subjects = {
+        normalize_thread_subject(str(row.get("subject") or ""))
+        for row in direct_rows
+        if row.get("subject")
+    }
+    selected = [
+        row
+        for row in rows
+        if row.get("id") in direct_ids
+        or (
+            (subject_base := normalize_thread_subject(str(row.get("subject") or "")))
+            and subject_base in direct_subjects
+        )
+    ]
+    return selected[:limit]
+
+
+def select_body_candidate_rows(rows: list[dict], direct_rows: list[dict], limit: int) -> list[dict]:
+    selected: list[dict] = []
+    seen_ids: set[object] = set()
+    direct_ids = {row.get("id") for row in direct_rows}
+    for row in rows:
+        if row.get("id") in direct_ids and row.get("id") not in seen_ids:
+            selected.append(row)
+            seen_ids.add(row.get("id"))
+    for row in rows:
+        if row.get("id") in seen_ids:
+            continue
+        selected.append(row)
+        seen_ids.add(row.get("id"))
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def enrich_rows_with_headers(rows: list[dict], *, account: str, mailbox: str) -> list[dict]:
+    ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+    header_rows = inline_headers_for_messages(account, mailbox, ids)
+    headers_by_id = {header_row.get("id"): str(header_row.get("allHeaders") or "") for header_row in header_rows}
+    return [build_search_meta_item(row, headers_by_id.get(row.get("id"), "")) for row in rows]
+
+
+def mark_body_hits(items: list[dict], body_hit_ids: set[int]) -> list[dict]:
+    return [
+        {**item, "bodyHit": True} if item.get("id") in body_hit_ids else dict(item)
+        for item in items
+    ]
+
+
+def find_body_hit_ids(body_rows: list[dict], query: str) -> set[int]:
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        return set()
+    return {
+        int(row["id"])
+        for row in body_rows
+        if row.get("id") is not None and normalized_query in str(row.get("content") or "").lower()
+    }
+
+
+def find_body_hit_ids_batched(
+    account: str,
+    mailbox: str,
+    rows: list[dict],
+    query: str,
+    *,
+    max_hits: int,
+    batch_size: int = 8,
+) -> set[int]:
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        return set()
+    hits: set[int] = set()
+    message_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+    step = max(1, batch_size)
+    for start in range(0, len(message_ids), step):
+        batch_ids = message_ids[start : start + step]
+        try:
+            body_rows = inline_bodies_for_messages(account, mailbox, batch_ids)
+        except SystemExit:
+            continue
+        hits |= find_body_hit_ids(body_rows, normalized_query)
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+
+def collect_search_items(payload: dict, *, scan_limit: int, context_limit: int, query: str) -> list[dict]:
+    mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
+    include_accounts = [str(payload["account"])] if payload.get("account") else list_account_names_fast()
+    items: list[dict] = []
+    for account_name in include_accounts:
+        try:
+            rows = recent_rows_for_account(account_name, mailbox_name, scan_limit)
+        except SystemExit:
+            continue
+        direct_rows = [row for row in rows if score_basic_row(row, query) > 0]
+        if direct_rows:
+            selected_rows = select_context_rows(rows, direct_rows, limit=max(context_limit, len(direct_rows)))
+            items.extend(enrich_rows_with_headers(selected_rows, account=account_name, mailbox=mailbox_name))
+            continue
+        try:
+            fallback_rows = inline_triage_meta_for_account(account_name, mailbox_name, context_limit)
+        except SystemExit:
+            continue
+        for row in fallback_rows:
+            headers = str(row.pop("allHeaders", "") or "")
+            items.append(build_search_meta_item(row, headers))
+    return items
+
+
+def collect_search_items_with_body(
+    payload: dict,
+    *,
+    scan_limit: int,
+    context_limit: int,
+    body_scan_limit: int,
+    context_scan_limit: int | None,
+    query: str,
+) -> list[dict]:
+    mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
+    include_accounts = [str(payload["account"])] if payload.get("account") else list_account_names_fast()
+    items: list[dict] = []
+    for account_name in include_accounts:
+        try:
+            rows = recent_rows_for_account(account_name, mailbox_name, scan_limit)
+        except SystemExit:
+            continue
+        metadata_direct_rows = [row for row in rows if score_basic_row(row, query) > 0]
+        candidate_rows = select_body_candidate_rows(rows, metadata_direct_rows, body_scan_limit)
+        body_hit_ids = find_body_hit_ids_batched(
+            account_name,
+            mailbox_name,
+            candidate_rows,
+            query,
+            max_hits=max(1, context_limit // 2),
+        )
+        direct_ids = {int(row["id"]) for row in metadata_direct_rows if row.get("id") is not None} | body_hit_ids
+        if not direct_ids:
+            continue
+        context_rows = rows
+        if metadata_direct_rows and context_scan_limit and context_scan_limit > len(rows):
+            try:
+                extra_rows = recent_rows_for_account(
+                    account_name,
+                    mailbox_name,
+                    context_scan_limit - len(rows),
+                    start_index=len(rows) + 1,
+                )
+            except SystemExit:
+                extra_rows = []
+            context_rows = rows + extra_rows
+        direct_rows = [row for row in context_rows if row.get("id") in direct_ids]
+        selected_rows = select_context_rows(context_rows, direct_rows, limit=max(context_limit, len(direct_rows)))
+        account_items = enrich_rows_with_headers(selected_rows, account=account_name, mailbox=mailbox_name)
+        items.extend(mark_body_hits(account_items, body_hit_ids))
+    return items
 
 
 def fast_search(payload: dict) -> list[dict]:
@@ -820,224 +864,28 @@ def fast_search_with_body(payload: dict) -> list[dict]:
     return search_meta_items(items, query=query, limit=requested_limit)
 
 
-def collect_meta_items(payload: dict, *, limit: int, include_thread: bool) -> list[dict]:
-    mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
-    if payload.get("account"):
-        accounts = [str(payload["account"])]
-    else:
-        accounts = list_account_names_fast()
-    items: list[dict] = []
-    for account_name in accounts:
-        try:
-            rows = inline_triage_meta_for_account(account_name, mailbox_name, limit)
-        except SystemExit:
-            continue
-        for row in rows:
-            headers = str(row.pop("allHeaders", "") or "")
-            if include_thread:
-                items.append(build_search_meta_item(row, headers))
-            else:
-                items.append(build_triage_meta_item(row, headers))
-    return items
-
-
-def score_basic_row(row: dict, query: str) -> int:
-    normalized_query = query.strip().lower()
-    if not normalized_query:
-        return 0
-    haystacks = [
-        str(row.get("subject") or "").lower(),
-        normalize_thread_subject(str(row.get("subject") or "")),
-        str(row.get("sender") or "").lower(),
-        str(row.get("messageId") or "").lower(),
-    ]
-    score = 0
-    if normalized_query in haystacks[3]:
-        score += 120
-    if normalized_query in haystacks[0]:
-        score += 90
-    if normalized_query in haystacks[1]:
-        score += 70
-    if normalized_query in haystacks[2]:
-        score += 80
-    return score
-
-
-def select_context_rows(rows: list[dict], direct_rows: list[dict], limit: int) -> list[dict]:
-    direct_ids = {row.get("id") for row in direct_rows}
-    direct_subjects = {
-        normalize_thread_subject(str(row.get("subject") or ""))
-        for row in direct_rows
-        if row.get("subject")
-    }
-    selected: list[dict] = []
-    for row in rows:
-        subject_base = normalize_thread_subject(str(row.get("subject") or ""))
-        if row.get("id") in direct_ids or (subject_base and subject_base in direct_subjects):
-            selected.append(row)
-    return selected[:limit]
-
-
-def select_body_candidate_rows(rows: list[dict], direct_rows: list[dict], limit: int) -> list[dict]:
-    selected: list[dict] = []
-    seen_ids: set[object] = set()
-    direct_ids = {row.get("id") for row in direct_rows}
-    for row in rows:
-        if row.get("id") in direct_ids and row.get("id") not in seen_ids:
-            selected.append(row)
-            seen_ids.add(row.get("id"))
-    for row in rows:
-        if row.get("id") in seen_ids:
-            continue
-        selected.append(row)
-        seen_ids.add(row.get("id"))
-        if len(selected) >= limit:
-            break
-    return selected[:limit]
-
-
-def enrich_rows_with_headers(rows: list[dict], *, account: str, mailbox: str) -> list[dict]:
-    header_rows = inline_headers_for_messages(account, mailbox, [int(row["id"]) for row in rows if row.get("id") is not None])
-    headers_by_id = {header_row.get("id"): str(header_row.get("allHeaders") or "") for header_row in header_rows}
-    items: list[dict] = []
-    for row in rows:
-        headers = headers_by_id.get(row.get("id"), "")
-        items.append(build_search_meta_item(row, headers))
-    return items
-
-
-def mark_body_hits(items: list[dict], body_hit_ids: set[int]) -> list[dict]:
-    output: list[dict] = []
-    for item in items:
-        next_item = dict(item)
-        if item.get("id") in body_hit_ids:
-            next_item["bodyHit"] = True
-        output.append(next_item)
-    return output
-
-
-def find_body_hit_ids(body_rows: list[dict], query: str) -> set[int]:
-    normalized_query = query.strip().lower()
-    if not normalized_query:
-        return set()
-    hits: set[int] = set()
-    for row in body_rows:
-        content = str(row.get("content") or "").lower()
-        if normalized_query in content and row.get("id") is not None:
-            hits.add(int(row["id"]))
-    return hits
-
-
-def find_body_hit_ids_batched(
-    account: str,
-    mailbox: str,
-    rows: list[dict],
-    query: str,
-    *,
-    max_hits: int,
-    batch_size: int = 8,
-) -> set[int]:
-    normalized_query = query.strip().lower()
-    if not normalized_query:
-        return set()
-    hits: set[int] = set()
-    message_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
-    for start in range(0, len(message_ids), max(1, batch_size)):
-        batch_ids = message_ids[start : start + max(1, batch_size)]
-        try:
-            body_rows = inline_bodies_for_messages(account, mailbox, batch_ids)
-        except SystemExit:
-            continue
-        hits |= find_body_hit_ids(body_rows, normalized_query)
-        if len(hits) >= max_hits:
-            break
-    return hits
-
-
-def collect_search_items(payload: dict, *, scan_limit: int, context_limit: int, query: str) -> list[dict]:
-    mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
-    include_accounts = [str(payload["account"])] if payload.get("account") else list_account_names_fast()
-    items: list[dict] = []
-    for account_name in include_accounts:
-        try:
-            rows = search_recent_rows_for_account(account_name, mailbox_name, scan_limit)
-        except SystemExit:
-            continue
-        direct_rows = [row for row in rows if score_basic_row(row, query) > 0]
-        if direct_rows:
-            selected_rows = select_context_rows(rows, direct_rows, limit=max(context_limit, len(direct_rows)))
-            items.extend(enrich_rows_with_headers(selected_rows, account=account_name, mailbox=mailbox_name))
-            continue
-        try:
-            fallback_rows = inline_triage_meta_for_account(account_name, mailbox_name, context_limit)
-        except SystemExit:
-            continue
-        for row in fallback_rows:
-            headers = str(row.pop("allHeaders", "") or "")
-            items.append(build_search_meta_item(row, headers))
-    return items
-
-
-def collect_search_items_with_body(
-    payload: dict,
-    *,
-    scan_limit: int,
-    context_limit: int,
-    body_scan_limit: int,
-    context_scan_limit: int | None,
-    query: str,
-) -> list[dict]:
-    mailbox_name = str(payload.get("mailboxPath") or payload.get("mailbox") or "INBOX")
-    include_accounts = [str(payload["account"])] if payload.get("account") else list_account_names_fast()
-    items: list[dict] = []
-    for account_name in include_accounts:
-        try:
-            rows = search_recent_rows_for_account(account_name, mailbox_name, scan_limit)
-        except SystemExit:
-            continue
-        metadata_direct_rows = [row for row in rows if score_basic_row(row, query) > 0]
-        candidate_rows = select_body_candidate_rows(rows, metadata_direct_rows, body_scan_limit)
-        body_hit_ids = find_body_hit_ids_batched(
-            account_name,
-            mailbox_name,
-            candidate_rows,
-            query,
-            max_hits=max(1, context_limit // 2),
-        )
-        direct_ids = {int(row["id"]) for row in metadata_direct_rows if row.get("id") is not None} | body_hit_ids
-        if not direct_ids:
-            continue
-        context_rows = rows
-        if metadata_direct_rows and context_scan_limit and context_scan_limit > len(rows):
-            try:
-                extra_rows = search_recent_rows_for_account(
-                    account_name,
-                    mailbox_name,
-                    context_scan_limit - len(rows),
-                    start_index=len(rows) + 1,
-                )
-            except SystemExit:
-                extra_rows = []
-            context_rows = rows + extra_rows
-        direct_rows = [row for row in context_rows if row.get("id") in direct_ids]
-        selected_rows = select_context_rows(context_rows, direct_rows, limit=max(context_limit, len(direct_rows)))
-        account_items = enrich_rows_with_headers(selected_rows, account=account_name, mailbox=mailbox_name)
-        items.extend(mark_body_hits(account_items, body_hit_ids))
-    return items
-
-
 def triage_meta(payload: dict) -> list[dict]:
     requested_limit = int(payload.get("limit", 20))
     include_read = bool(payload.get("includeRead"))
     on_date = payload.get("onDate")
     per_account_limit = int(payload.get("maxScanPerBox") or max(requested_limit, 5))
     items = collect_meta_items(payload, limit=per_account_limit, include_thread=False)
-    return filter_triage_items(items, on_date=str(on_date) if on_date else None, include_read=include_read)[:requested_limit]
+    return filter_triage_items(
+        items,
+        on_date=str(on_date) if on_date else None,
+        include_read=include_read,
+    )[:requested_limit]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="apple-apps")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "mail-app", "opl-relay", "himalaya"),
+        default="auto",
+        help="Mail backend: auto delegates read/search to opl-relay when available, with Mail.app JXA fallback",
+    )
 
     domains = parser.add_subparsers(dest="domain", required=True)
     mail = domains.add_parser("mail", help="Manage Apple Mail")
@@ -1110,7 +958,7 @@ def add_message_locator(parser: argparse.ArgumentParser) -> None:
 def args_to_payload(namespace: argparse.Namespace) -> dict:
     payload = {}
     for key, value in vars(namespace).items():
-        if key in {"pretty", "domain", "mail_action"}:
+        if key in {"pretty", "backend", "domain", "mail_action"}:
             continue
         if value is None:
             continue
@@ -1118,9 +966,36 @@ def args_to_payload(namespace: argparse.Namespace) -> dict:
     return payload
 
 
-def main() -> int:
+def dispatch_mail_action(action: str, payload: dict, *, backend: str = "auto") -> object:
+    if backend == "opl-relay":
+        delegated = delegate_to_opl_relay(action, payload, allow_store_search=True)
+        if delegated is None:
+            raise SystemExit(f"opl-relay backend unavailable or unsupported for action: {action}")
+        return delegated
+    if backend == "himalaya":
+        delegated = delegate_to_himalaya(action, payload)
+        if delegated is None:
+            raise SystemExit(f"himalaya backend unavailable or unsupported for action: {action}")
+        return delegated
+    if backend == "auto" and action in {"accounts", "mailboxes", "recent", "read"}:
+        delegated = delegate_to_opl_relay(action, payload, allow_store_search=False)
+        if delegated is not None:
+            return delegated
+
+    if action == "recent" and can_use_fast_recent(payload):
+        return fast_recent(payload)
+    if action == "search" and can_use_fast_recent(payload) and payload.get("includeBody"):
+        return fast_search_with_body(payload)
+    if action == "search" and can_use_fast_recent(payload) and not payload.get("includeBody"):
+        return fast_search(payload)
+    if action == "triage-meta":
+        return triage_meta(payload)
+    return run_mail(action, payload)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.domain != "mail":
         parser.error(f"unsupported domain: {args.domain}")
@@ -1132,26 +1007,7 @@ def main() -> int:
         parser.error("mail move requires --to-mailbox or --to-mailbox-path")
 
     payload = args_to_payload(args)
-    if args.mail_action == "recent" and can_use_fast_recent(payload):
-        result = fast_recent(payload)
-    elif args.mail_action == "search" and can_use_fast_recent(payload) and payload.get("includeBody"):
-        result = fast_search_with_body(payload)
-    elif args.mail_action == "search" and can_use_fast_recent(payload) and not payload.get("includeBody"):
-        result = fast_search(payload)
-    elif args.mail_action == "triage-meta":
-        result = triage_meta(payload)
-    elif args.mail_action == "read" and can_use_inline_mailbox(payload):
-        result = inline_read(payload)
-    elif args.mail_action == "mark" and can_use_inline_mailbox(payload):
-        result = inline_mark(payload)
-    elif args.mail_action == "move" and can_use_inline_mailbox(payload) and can_use_inline_mailbox({"account": payload.get("toAccount") or payload.get("account"), "mailboxPath": payload.get("toMailboxPath") or payload.get("toMailbox")}):
-        result = inline_move(payload)
-    elif args.mail_action == "archive" and can_use_inline_mailbox(payload):
-        result = inline_archive(payload)
-    elif args.mail_action == "delete" and can_use_inline_mailbox(payload):
-        result = inline_delete(payload)
-    else:
-        result = run_mail(args.mail_action, payload)
+    result = dispatch_mail_action(args.mail_action, payload, backend=args.backend)
     dump_json(result, pretty=args.pretty)
     return 0
 

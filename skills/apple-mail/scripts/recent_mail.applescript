@@ -34,26 +34,34 @@ on run argv
     set accountName to item 1 of argv
     set mailboxName to item 2 of argv
     set requestedLimit to (item 3 of argv) as integer
+    set startIndex to 1
+    if (count of argv) >= 4 then
+        set startIndex to (item 4 of argv) as integer
+    end if
+    if startIndex < 1 then
+        set startIndex to 1
+    end if
 
     tell application "Mail"
         tell mailbox mailboxName of account accountName
             set totalCount to count of messages
-            if totalCount is 0 then
+            if totalCount is 0 or startIndex > totalCount then
                 return ""
             end if
-            set endIndex to requestedLimit
+            set endIndex to (startIndex + requestedLimit - 1)
             if endIndex > totalCount then
                 set endIndex to totalCount
             end if
-            set messageIds to (get id of messages 1 thru endIndex)
-            set internetMessageIds to (get message id of messages 1 thru endIndex)
-            set subjects to (get subject of messages 1 thru endIndex)
-            set senders to (get sender of messages 1 thru endIndex)
-            set readStatuses to (get read status of messages 1 thru endIndex)
-            set receivedDates to (get date received of messages 1 thru endIndex)
-            set sentDates to (get date sent of messages 1 thru endIndex)
+            set messageIds to (get id of messages startIndex thru endIndex)
+            set internetMessageIds to (get message id of messages startIndex thru endIndex)
+            set subjects to (get subject of messages startIndex thru endIndex)
+            set senders to (get sender of messages startIndex thru endIndex)
+            set readStatuses to (get read status of messages startIndex thru endIndex)
+            set receivedDates to (get date received of messages startIndex thru endIndex)
+            set sentDates to (get date sent of messages startIndex thru endIndex)
             set rows to {}
-            repeat with i from 1 to endIndex
+            set rowCount to (endIndex - startIndex + 1)
+            repeat with i from 1 to rowCount
                 set end of rows to ((item i of messageIds as text) & tab & my sanitizeText(item i of internetMessageIds) & tab & my sanitizeText(item i of subjects) & tab & my sanitizeText(item i of senders) & tab & (item i of readStatuses as text) & tab & mailboxName & tab & accountName & tab & my isoLocalDate(item i of receivedDates) & tab & my isoLocalDate(item i of sentDates))
             end repeat
         end tell

@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "apple_apps.py"
 SPEC = importlib.util.spec_from_file_location("apple_apps", SCRIPT_PATH)
 assert SPEC and SPEC.loader
@@ -279,3 +278,71 @@ def test_find_body_hit_ids_batched_stops_after_hit_batch(monkeypatch) -> None:
 
     assert hits == {3}
     assert calls == [[1, 2], [3, 4]]
+
+
+def test_extract_header_metadata_decodes_rfc2047_and_folded_headers() -> None:
+    headers = (
+        "Received: from mx.example.test by mail.example.test;\r\n"
+        " Thu, 19 Mar 2026 09:15:30 +0800\r\n"
+        "From: =?UTF-8?B?5byg5LiJ?= <zhang@example.test>\r\n"
+        "Subject: =?UTF-8?B?5rWL6K+V5Li76aKY?=\r\n"
+        " =?UTF-8?Q?_Part_2?=\r\n"
+        "Message-Id: <folded-1@example.test>\r\n"
+        "References: <root@example.test>\r\n"
+        " <mid@example.test>\r\n"
+    )
+
+    metadata = apple_apps.extract_header_metadata(headers)
+    thread = apple_apps.extract_thread_metadata({}, headers)
+
+    assert metadata["sender"] == "张三 <zhang@example.test>"
+    assert metadata["subject"] == "测试主题 Part 2"
+    assert metadata["headerDateIso"] == "2026-03-19T09:15:30+08:00"
+    assert metadata["dateSource"] == "Received"
+    assert thread["messageId"] == "<folded-1@example.test>"
+    assert thread["references"] == ["<root@example.test>", "<mid@example.test>"]
+
+
+def test_dispatch_delegates_to_opl_relay_and_falls_back_to_mail_app(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs):
+        calls.append(cmd)
+        if cmd[0] == "/usr/local/bin/opl-relay":
+            if "accounts" in cmd:
+                return type("R", (), {"returncode": 0, "stdout": '{"ok": true, "accounts": [{"name": "Work"}]}', "stderr": ""})()
+            if "search" in cmd:
+                return type("R", (), {"returncode": 0, "stdout": '{"ok": true, "messages": [{"storage_ref": "email-store://work/INBOX/1/abc"}]}', "stderr": ""})()
+            return type("R", (), {"returncode": 2, "stdout": "", "stderr": "unsupported"})()
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(apple_apps, "resolve_opl_relay_bin", lambda: "/usr/local/bin/opl-relay")
+    monkeypatch.setattr(apple_apps.subprocess, "run", fake_run)
+
+    accounts = apple_apps.dispatch_mail_action("accounts", {}, backend="auto")
+    assert accounts == [{"name": "Work"}]
+    assert calls[-1] == ["/usr/local/bin/opl-relay", "--json", "apple-mail", "accounts"]
+
+    searched = apple_apps.dispatch_mail_action("search", {"query": "invoice", "limit": 5}, backend="opl-relay")
+    assert searched == [{"storage_ref": "email-store://work/INBOX/1/abc"}]
+
+    fallback_called: list[tuple[str, dict]] = []
+    monkeypatch.setattr(apple_apps, "run_mail", lambda action, payload: fallback_called.append((action, payload)) or {"id": 9, "subject": "Fallback"})
+    read_result = apple_apps.dispatch_mail_action("read", {"account": "Work", "mailboxPath": "INBOX", "id": "9"}, backend="auto")
+    assert read_result == {"id": 9, "subject": "Fallback"}
+    assert fallback_called == [("read", {"account": "Work", "mailboxPath": "INBOX", "id": "9"})]
+
+
+def test_dispatch_delegates_to_himalaya_when_selected(monkeypatch) -> None:
+    captured: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs):
+        captured.append(cmd)
+        return type("R", (), {"returncode": 0, "stdout": '[{"id": "10", "subject": "Himalaya hit"}]', "stderr": ""})()
+
+    monkeypatch.setattr(apple_apps, "resolve_himalaya_bin", lambda: "/opt/homebrew/bin/himalaya")
+    monkeypatch.setattr(apple_apps.subprocess, "run", fake_run)
+
+    result = apple_apps.dispatch_mail_action("search", {"account": "work", "query": "invoice", "limit": 5}, backend="himalaya")
+    assert result == [{"id": "10", "subject": "Himalaya hit"}]
+    assert captured == [["/opt/homebrew/bin/himalaya", "--output", "json", "envelope", "list", "--account", "work", "--page-size", "5", "invoice"]]

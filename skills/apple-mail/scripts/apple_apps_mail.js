@@ -28,6 +28,12 @@ function run(argv) {
         return JSON.stringify(archiveMessage(app, payload));
       case "delete":
         return JSON.stringify(deleteMessage(app, payload));
+      case "triageMeta":
+        return JSON.stringify(triageMetaMessages(app, payload));
+      case "batchHeaders":
+        return JSON.stringify(batchMessageDetails(app, payload, false));
+      case "batchBodies":
+        return JSON.stringify(batchMessageDetails(app, payload, true));
       default:
         throw new Error("unsupported action: " + action);
     }
@@ -237,6 +243,53 @@ function deleteMessage(app, payload) {
     mailbox: source.mailboxName,
     mailboxPath: source.mailboxPath,
   };
+}
+
+function triageMetaMessages(app, payload) {
+  var info = locateMailboxContext(app, payload);
+  var limit = clampInt(payload.limit, 20, 1, 2000);
+  var out = [];
+  scanMailboxMessages(info.mailbox, limit, function (message) {
+    out.push({
+      id: safeCall(function () { return message.id(); }, null),
+      messageId: safeCall(function () { return String(message.messageId()); }, null),
+      subject: safeCall(function () { return String(message.subject()); }, ""),
+      sender: safeCall(function () { return String(message.sender()); }, ""),
+      read: safeCall(function () { return !!message.readStatus(); }, false),
+      mailbox: info.mailboxName,
+      mailboxPath: info.mailboxPath,
+      account: info.accountName,
+      allHeaders: safeCall(function () { return String(message.allHeaders()); }, ""),
+    });
+  });
+  return out;
+}
+
+function batchMessageDetails(app, payload, includeContent) {
+  var info = locateMailboxContext(app, payload);
+  var ids = Array.isArray(payload.ids) ? payload.ids : [];
+  var out = [];
+  for (var i = 0; i < ids.length; i++) {
+    var numericId = Number(ids[i]);
+    if (!isFinite(numericId)) {
+      continue;
+    }
+    var item = safeCall(function () {
+      var message = info.mailbox.messages.byId(numericId);
+      var entry = {
+        id: message.id(),
+        allHeaders: String(message.allHeaders()),
+      };
+      if (includeContent) {
+        entry.content = String(message.content());
+      }
+      return entry;
+    }, null);
+    if (item) {
+      out.push(item);
+    }
+  }
+  return out;
 }
 
 function requireAccount(app, accountName) {
